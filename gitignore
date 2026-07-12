@@ -1,0 +1,13 @@
+# never commit books or their byproducts
+*.pdf
+*.epub
+*.azw3
+*.mobi
+*.ocr.txt
+inbox/
+outbox/
+archive/
+logs/
+out/
+work/
+__pycache__/

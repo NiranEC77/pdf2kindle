@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch /srv/pdf2kindle/inbox for new PDFs
+
+[Path]
+PathExistsGlob=/srv/pdf2kindle/inbox/*.pdf
+Unit=pdf2kindle.service
+
+[Install]
+WantedBy=multi-user.target

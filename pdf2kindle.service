@@ -1,0 +1,20 @@
+[Unit]
+Description=Convert PDFs dropped in the pdf2kindle inbox
+
+[Service]
+Type=oneshot
+User=hermes
+Group=hermes
+Environment=PDF2KINDLE_ROOT=/srv/pdf2kindle
+Environment=PDF2KINDLE_BIN=/opt/pdf2kindle/bin/pdf2kindle
+Environment=PDF2KINDLE_LANG=eng
+Environment=PDF2KINDLE_VARIANT=both
+Environment=PDF2KINDLE_FORMAT=both
+ExecStart=/opt/pdf2kindle/scripts/process_inbox.sh
+Nice=10
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/pdf2kindle
+NoNewPrivileges=yes

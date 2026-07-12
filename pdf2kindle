@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""
+pdf2kindle — fully local PDF -> Kindle (EPUB/AZW3) converter.
+
+Design rules:
+  * Nothing leaves the machine. No network calls, ever.
+  * Force OCR by default. A PDF that "has text" can still have a garbage
+    text layer; garbage-in-garbage-out is the #1 failure mode here.
+  * Every stage asserts a postcondition and exits non-zero if it fails.
+    We verify by inspecting artifacts, not by claiming success.
+
+Requires: ocrmypdf, tesseract, calibre (ebook-convert). See install.sh.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".svg", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+# ---------------------------------------------------------------- utilities
+
+def log(msg: str) -> None:
+    print(f"[pdf2kindle] {msg}", flush=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"[pdf2kindle] FAIL: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    log("$ " + " ".join(str(c) for c in cmd))
+    return subprocess.run([str(c) for c in cmd], check=False, **kw)
+
+
+def require_tools(tools: list[str]) -> None:
+    missing = [t for t in tools if shutil.which(t) is None]
+    if missing:
+        die(f"missing required tool(s): {', '.join(missing)}. Run ./install.sh")
+
+
+@dataclass
+class Report:
+    """Deterministic record of what actually happened. Printed at the end."""
+    checks: list[tuple[str, bool, str]] = field(default_factory=list)
+
+    def check(self, name: str, ok: bool, detail: str = "") -> bool:
+        self.checks.append((name, ok, detail))
+        log(f"{'PASS' if ok else 'FAIL'}  {name}{(' — ' + detail) if detail else ''}")
+        return ok
+
+    def failed(self) -> list[str]:
+        return [n for n, ok, _ in self.checks if not ok]
+
+
+# ---------------------------------------------------------------- stage: OCR
+
+def ocr(src: Path, work: Path, lang: str, force: bool, clean: bool,
+        optimize: int, rep: Report) -> tuple[Path, Path]:
+    """Rasterize-and-recognize. Returns (ocr_pdf, sidecar_txt)."""
+    out_pdf = work / "ocr.pdf"
+    sidecar = work / "ocr.txt"
+
+    cmd = [
+        "ocrmypdf",
+        "--language", lang,
+        "--rotate-pages",
+        "--deskew",
+        "--optimize", str(optimize),
+        "--output-type", "pdf",
+        "--sidecar", sidecar,
+        "--jobs", str(os.cpu_count() or 4),
+    ]
+    if clean:
+        cmd += ["--clean"]          # needs unpaper
+    if force:
+        cmd += ["--force-ocr"]      # replaces the existing (corrupt) text layer
+    else:
+        cmd += ["--skip-text"]
+    cmd += [src, out_pdf]
+
+    proc = run(cmd)
+    rep.check("ocrmypdf exit 0", proc.returncode == 0, f"rc={proc.returncode}")
+    rep.check("ocr.pdf produced", out_pdf.exists() and out_pdf.stat().st_size > 0,
+              f"{out_pdf.stat().st_size if out_pdf.exists() else 0} bytes")
+    if not out_pdf.exists():
+        die("OCR produced no output; aborting before conversion")
+    return out_pdf, sidecar
+
+
+def verify_text(sidecar: Path, pages: int, rep: Report, min_wpp: int) -> None:
+    """Sanity-check the OCR text layer instead of assuming it worked."""
+    if not sidecar.exists():
+        rep.check("sidecar text exists", False)
+        return
+    text = sidecar.read_text(errors="replace")
+    words = len(text.split())
+    wpp = words / max(pages, 1)
+    printable = sum(c.isalnum() or c.isspace() or c in ".,;:'\"()-–—?!" for c in text)
+    ratio = printable / max(len(text), 1)
+
+    rep.check("OCR word density", wpp >= min_wpp, f"{words} words / {pages} pages = {wpp:.0f} wpp")
+    rep.check("OCR character sanity", ratio >= 0.90, f"{ratio:.1%} recognizable chars")
+    log("---- first 300 chars of OCR text (spot-check this yourself) ----")
+    print(text[:300].strip() or "(empty)")
+    log("---------------------------------------------------------------")
+
+
+def page_count(pdf: Path) -> int:
+    if shutil.which("pdfinfo"):
+        p = run(["pdfinfo", pdf], capture_output=True, text=True)
+        m = re.search(r"Pages:\s+(\d+)", p.stdout or "")
+        if m:
+            return int(m.group(1))
+    return 1
+
+
+# --------------------------------------------------------- stage: conversion
+
+def to_epub(pdf: Path, out: Path, no_images: bool, title: str, rep: Report) -> Path:
+    cmd = [
+        "ebook-convert", pdf, out,
+        "--enable-heuristics",
+        "--output-profile", "kindle_pw3",
+        "--title", title,
+        "--pdf-engine", "pdftohtml",
+    ]
+    if no_images:
+        cmd += ["--no-images"]  # calibre PDF Input option
+    proc = run(cmd)
+    if proc.returncode != 0:
+        # --pdf-engine is not present on every calibre build; retry without it
+        cmd = [c for c in cmd if c not in ("--pdf-engine", "pdftohtml")]
+        proc = run(cmd)
+    rep.check("ebook-convert exit 0", proc.returncode == 0, f"rc={proc.returncode}")
+    rep.check("epub produced", out.exists() and out.stat().st_size > 0)
+    if not out.exists():
+        die("conversion produced no EPUB")
+    return out
+
+
+def to_azw3(epub: Path, out: Path, rep: Report) -> Path:
+    proc = run(["ebook-convert", epub, out, "--output-profile", "kindle_pw3"])
+    rep.check("azw3 produced", proc.returncode == 0 and out.exists())
+    return out
+
+
+# ------------------------------------------------------ stage: image removal
+
+IMG_TAG = re.compile(rb"<(img|image)\b[^>]*/?>", re.I)
+SVG_BLOCK = re.compile(rb"<svg\b.*?</svg>", re.I | re.S)
+OPF_IMG_ITEM = re.compile(rb'<item\b[^>]*media-type="image/[^"]*"[^>]*/>', re.I)
+OPF_COVER_META = re.compile(rb'<meta\b[^>]*name="cover"[^>]*/>', re.I)
+
+
+def strip_images(epub: Path, rep: Report) -> None:
+    """Rewrite the EPUB in place with every image removed. Belt and braces on
+    top of calibre's --no-images, because we assert the postcondition."""
+    tmp = epub.with_suffix(".stripped.epub")
+    removed = 0
+    with zipfile.ZipFile(epub) as zin, zipfile.ZipFile(tmp, "w") as zout:
+        # mimetype must be first and stored uncompressed
+        try:
+            zout.writestr(zipfile.ZipInfo("mimetype"),
+                          zin.read("mimetype"), zipfile.ZIP_STORED)
+        except KeyError:
+            pass
+        for item in zin.infolist():
+            name = item.filename
+            if name == "mimetype":
+                continue
+            if Path(name).suffix.lower() in IMAGE_EXT:
+                removed += 1
+                continue
+            data = zin.read(name)
+            low = name.lower()
+            if low.endswith((".xhtml", ".html", ".htm")):
+                data = IMG_TAG.sub(b"", SVG_BLOCK.sub(b"", data))
+            elif low.endswith(".opf"):
+                data = OPF_COVER_META.sub(b"", OPF_IMG_ITEM.sub(b"", data))
+            elif low.endswith(".css"):
+                data = re.sub(rb"url\([^)]*\)", b"none", data, flags=re.I)
+            zout.writestr(item, data, zipfile.ZIP_DEFLATED)
+    tmp.replace(epub)
+
+    with zipfile.ZipFile(epub) as z:
+        left = [n for n in z.namelist() if Path(n).suffix.lower() in IMAGE_EXT]
+    rep.check("epub contains zero images", not left,
+              f"removed {removed}, remaining {len(left)}")
+
+
+def epub_stats(epub: Path, rep: Report) -> None:
+    with zipfile.ZipFile(epub) as z:
+        docs = [n for n in z.namelist() if n.lower().endswith((".xhtml", ".html", ".htm"))]
+        imgs = [n for n in z.namelist() if Path(n).suffix.lower() in IMAGE_EXT]
+    rep.check("epub has content documents", len(docs) > 0, f"{len(docs)} docs, {len(imgs)} images")
+
+
+# ------------------------------------------------------------------- driver
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Local PDF -> Kindle converter (OCR-first).")
+    ap.add_argument("pdf", type=Path)
+    ap.add_argument("-o", "--outdir", type=Path, default=Path("./out"))
+    ap.add_argument("--variant", choices=["full", "paperwhite", "both"], default="both",
+                    help="paperwhite = text-only, no images (small, fast page turns)")
+    ap.add_argument("--format", choices=["epub", "azw3", "both"], default="both")
+    ap.add_argument("--lang", default="eng", help="tesseract language(s), e.g. eng or eng+heb")
+    ap.add_argument("--skip-ocr", action="store_true",
+                    help="trust the existing text layer (usually a mistake)")
+    ap.add_argument("--no-force-ocr", action="store_true",
+                    help="OCR only pages that lack text (default is --force-ocr)")
+    ap.add_argument("--clean", action="store_true", help="unpaper pre-clean (scans)")
+    ap.add_argument("--optimize", type=int, default=1, choices=[0, 1, 2, 3])
+    ap.add_argument("--min-words-per-page", type=int, default=50)
+    ap.add_argument("--keep-work", action="store_true")
+    args = ap.parse_args()
+
+    src = args.pdf.expanduser().resolve()
+    if not src.is_file():
+        die(f"no such file: {src}")
+    require_tools(["ocrmypdf", "ebook-convert"] if not args.skip_ocr else ["ebook-convert"])
+
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    stem = re.sub(r"[^\w.-]+", "_", src.stem)
+    rep = Report()
+    work = Path(tempfile.mkdtemp(prefix="pdf2kindle-"))
+    log(f"source : {src} ({src.stat().st_size/1e6:.1f} MB)")
+    log(f"workdir: {work}")
+
+    try:
+        pages = page_count(src)
+        if args.skip_ocr:
+            log("WARNING: --skip-ocr. If the text layer is corrupt, your Kindle file will be too.")
+            book_pdf = src
+        else:
+            book_pdf, sidecar = ocr(src, work, args.lang,
+                                    force=not args.no_force_ocr,
+                                    clean=args.clean, optimize=args.optimize, rep=rep)
+            verify_text(sidecar, pages, rep, args.min_words_per_page)
+            shutil.copy2(sidecar, args.outdir / f"{stem}.ocr.txt")
+
+        variants = ["full", "paperwhite"] if args.variant == "both" else [args.variant]
+        produced: list[Path] = []
+        for v in variants:
+            suffix = "" if v == "full" else "-paperwhite"
+            epub = args.outdir / f"{stem}{suffix}.epub"
+            to_epub(book_pdf, epub, no_images=(v == "paperwhite"),
+                    title=src.stem.replace("_", " "), rep=rep)
+            if v == "paperwhite":
+                strip_images(epub, rep)
+            epub_stats(epub, rep)
+            produced.append(epub)
+            if args.format in ("azw3", "both"):
+                produced.append(to_azw3(epub, args.outdir / f"{stem}{suffix}.azw3", rep))
+        if args.format == "azw3":
+            for p in [p for p in produced if p.suffix == ".epub"]:
+                p.unlink(missing_ok=True)
+                produced.remove(p)
+    finally:
+        if not args.keep_work:
+            shutil.rmtree(work, ignore_errors=True)
+
+    print()
+    log("artifacts:")
+    for p in produced:
+        log(f"  {p}  ({p.stat().st_size/1e6:.2f} MB)")
+    bad = rep.failed()
+    if bad:
+        die("postconditions failed: " + ", ".join(bad), code=2)
+    log("all postconditions passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
