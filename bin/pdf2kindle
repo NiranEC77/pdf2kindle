@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 pdf2kindle — fully local PDF -> Kindle (EPUB/AZW3) converter.
@@ -129,25 +130,53 @@ def page_count(pdf: Path) -> int:
 # --------------------------------------------------------- stage: conversion
 
 def to_epub(pdf: Path, out: Path, no_images: bool, title: str, rep: Report) -> Path:
+    # Deliberately NOT forcing --pdf-engine pdftohtml: poppler's standalone
+    # pdftohtml falls back to whole-page rasterization on graphically dense
+    # PDFs (one image per page instead of real text). Calibre's own default
+    # PDF parser handles this correctly and uses the OCR text layer we just
+    # built. Only reach for --pdf-engine pdftohtml by hand if the default
+    # engine itself fails to produce output.
     cmd = [
         "ebook-convert", pdf, out,
         "--enable-heuristics",
         "--output-profile", "kindle_pw3",
         "--title", title,
-        "--pdf-engine", "pdftohtml",
     ]
     if no_images:
         cmd += ["--no-images"]  # calibre PDF Input option
     proc = run(cmd)
-    if proc.returncode != 0:
-        # --pdf-engine is not present on every calibre build; retry without it
-        cmd = [c for c in cmd if c not in ("--pdf-engine", "pdftohtml")]
-        proc = run(cmd)
     rep.check("ebook-convert exit 0", proc.returncode == 0, f"rc={proc.returncode}")
     rep.check("epub produced", out.exists() and out.stat().st_size > 0)
     if not out.exists():
         die("conversion produced no EPUB")
     return out
+
+
+TAG_RE = re.compile(rb"<[^>]+>")
+
+
+def epub_word_count(epub: Path) -> int:
+    """Rough word count across all content documents in the EPUB."""
+    total = 0
+    with zipfile.ZipFile(epub) as z:
+        for name in z.namelist():
+            if name.lower().endswith((".xhtml", ".html", ".htm")):
+                text = TAG_RE.sub(b" ", z.read(name))
+                total += len(text.split())
+    return total
+
+
+def verify_epub_text_coverage(epub: Path, ocr_words: int, rep: Report,
+                               min_ratio: float = 0.5) -> None:
+    """Catches the failure mode where the PDF engine silently rasterizes
+    pages instead of using the OCR text layer: if the sidecar has real
+    text but the EPUB doesn't, something upstream threw the text away."""
+    if ocr_words <= 0:
+        return  # no OCR baseline to compare against (--skip-ocr was used)
+    epub_words = epub_word_count(epub)
+    ratio = epub_words / ocr_words
+    rep.check(f"{epub.name}: text carried into EPUB", ratio >= min_ratio,
+              f"{epub_words} words in EPUB vs {ocr_words} in OCR text ({ratio:.0%})")
 
 
 def to_azw3(epub: Path, out: Path, rep: Report) -> Path:
@@ -241,6 +270,7 @@ def main() -> int:
 
     try:
         pages = page_count(src)
+        ocr_words = 0
         if args.skip_ocr:
             log("WARNING: --skip-ocr. If the text layer is corrupt, your Kindle file will be too.")
             book_pdf = src
@@ -249,6 +279,7 @@ def main() -> int:
                                     force=not args.no_force_ocr,
                                     clean=args.clean, optimize=args.optimize, rep=rep)
             verify_text(sidecar, pages, rep, args.min_words_per_page)
+            ocr_words = len(sidecar.read_text(errors="replace").split())
             shutil.copy2(sidecar, args.outdir / f"{stem}.ocr.txt")
 
         variants = ["full", "paperwhite"] if args.variant == "both" else [args.variant]
@@ -258,6 +289,7 @@ def main() -> int:
             epub = args.outdir / f"{stem}{suffix}.epub"
             to_epub(book_pdf, epub, no_images=(v == "paperwhite"),
                     title=src.stem.replace("_", " "), rep=rep)
+            verify_epub_text_coverage(epub, ocr_words, rep)
             if v == "paperwhite":
                 strip_images(epub, rep)
             epub_stats(epub, rep)
