@@ -180,7 +180,31 @@ def verify_epub_text_coverage(epub: Path, ocr_words: int, rep: Report,
 
 def to_azw3(epub: Path, out: Path, rep: Report) -> Path:
     proc = run(["ebook-convert", epub, out, "--output-profile", "kindle_pw3"])
-    rep.check("azw3 produced", proc.returncode == 0 and out.exists())
+    ok = rep.check("azw3 produced", proc.returncode == 0 and out.exists(),
+                    f"rc={proc.returncode}")
+    if not ok:
+        die(f"AZW3 conversion failed for {epub.name}; aborting before the summary step")
+    return out
+
+
+def to_epub_from_text(txt: Path, out: Path, title: str, rep: Report) -> Path:
+    """Text-only path: convert the OCR sidecar directly, bypassing PDF page
+    rendering entirely. An OCR'd PDF keeps each scanned page as a raster
+    image with an invisible text layer on top -- any PDF->EPUB converter
+    reading that PDF sees "one image per page" no matter which engine flag
+    you pass. The .ocr.txt sidecar has no such image structure, so this is
+    the only reliable way to get genuinely reflowable, imageless text."""
+    cmd = [
+        "ebook-convert", txt, out,
+        "--enable-heuristics",
+        "--output-profile", "kindle_pw3",
+        "--title", title,
+    ]
+    proc = run(cmd)
+    rep.check("ebook-convert exit 0 (text->epub)", proc.returncode == 0, f"rc={proc.returncode}")
+    rep.check("epub produced (text->epub)", out.exists() and out.stat().st_size > 0)
+    if not out.exists():
+        die("text->EPUB conversion produced no output")
     return out
 
 
@@ -281,13 +305,26 @@ def main() -> int:
             ocr_words = len(sidecar.read_text(errors="replace").split())
             shutil.copy2(sidecar, args.outdir / f"{stem}.ocr.txt")
 
+        book_sidecar = sidecar if not args.skip_ocr else None
+
         variants = ["full", "paperwhite"] if args.variant == "both" else [args.variant]
         produced: list[Path] = []
         for v in variants:
             suffix = "" if v == "full" else "-paperwhite"
             epub = args.outdir / f"{stem}{suffix}.epub"
-            to_epub(book_pdf, epub, no_images=(v == "paperwhite"),
-                    title=src.stem.replace("_", " "), rep=rep)
+            if v == "paperwhite" and book_sidecar is not None:
+                # OCR'd PDFs keep each scanned page as a raster image with an
+                # invisible text overlay -- feeding that PDF to ebook-convert
+                # always yields "one image per page" regardless of engine
+                # flag. Convert the plain-text sidecar instead: no PDF page
+                # structure means nothing to rasterize.
+                to_epub_from_text(book_sidecar, epub, title=src.stem.replace("_", " "), rep=rep)
+            else:
+                if v == "paperwhite":
+                    log("WARNING: --skip-ocr means no text sidecar exists; "
+                        "falling back to PDF conversion, which may embed page images.")
+                to_epub(book_pdf, epub, no_images=(v == "paperwhite"),
+                        title=src.stem.replace("_", " "), rep=rep)
             verify_epub_text_coverage(epub, ocr_words, rep)
             if v == "paperwhite":
                 strip_images(epub, rep)
