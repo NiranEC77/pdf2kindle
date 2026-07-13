@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 pdf2kindle — fully local PDF -> Kindle (EPUB/AZW3) converter.
